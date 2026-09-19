@@ -44,6 +44,7 @@ export class NetworkRoom {
     });
 
     const closeOrError = () => {
+      if (!this.sessions.has(id)) return;
       this.sessions.delete(id);
       this.broadcast({ type: "peer-left", id }, id);
     };
@@ -73,16 +74,19 @@ export class NetworkRoom {
     if (data.type === "signal" && typeof data.to === "string") {
       const target = this.sessions.get(data.to);
       if (target) {
-        target.socket.send(
-          JSON.stringify({
-            type: "signal",
-            from: session.id,
-            fromName: session.name,
-            payload: data.payload,
-          })
-        );
+        try {
+          target.socket.send(
+            JSON.stringify({
+              type: "signal",
+              from: session.id,
+              fromName: session.name,
+              payload: data.payload,
+            })
+          );
+        } catch (err) {
+          this.sessions.delete(target.id);
+        }
       }
-      return;
     }
   }
 
@@ -99,9 +103,38 @@ export class NetworkRoom {
   }
 }
 
+function expandIpv6(ip) {
+  let addr = ip.split("%")[0];
+  const v4Match = addr.match(/(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4Match) {
+    const octets = v4Match[1].split(".").map(Number);
+    const hex1 = ((octets[0] << 8) | octets[1]).toString(16);
+    const hex2 = ((octets[2] << 8) | octets[3]).toString(16);
+    addr = addr.replace(v4Match[1], `${hex1}:${hex2}`);
+  }
+
+  const halves = addr.split("::");
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length > 1 && halves[1] ? halves[1].split(":") : [];
+  const missing = 8 - head.length - tail.length;
+  const groups = halves.length > 1
+    ? [...head, ...Array(Math.max(missing, 0)).fill("0"), ...tail]
+    : head;
+
+  return groups.map((g) => g.padStart(4, "0"));
+}
+
 function networkIdFromRequest(request) {
-  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-  return ip.replace(/[^a-zA-Z0-9.:]/g, "_");
+  const ip = (request.headers.get("CF-Connecting-IP") || "unknown").trim();
+
+  if (ip.includes(":")) {
+    const groups = expandIpv6(ip);
+    if (groups.length === 8) {
+      return "v6_" + groups.slice(0, 4).join("");
+    }
+  }
+
+  return "v4_" + ip.replace(/[^a-zA-Z0-9.]/g, "_");
 }
 
 export default {
