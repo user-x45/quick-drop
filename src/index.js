@@ -28,24 +28,36 @@ export class NetworkRoom {
       return new Response("WebSocket連携が必要です", { status: 426 });
     }
 
+    const url = new URL(request.url);
+    const clientKey = url.searchParams.get("clientKey") || crypto.randomUUID();
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
+
+    const existing = this.sessions.get(clientKey);
+    if (existing) {
+      this.sessions.delete(clientKey);
+      this.broadcast({ type: "peer-left", id: existing.id }, existing.id);
+      try {
+        existing.socket.close();
+      } catch (err) {}
+    }
 
     const id = crypto.randomUUID();
     const seed = Array.from(id).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
     const name = randomDeviceName(seed);
 
-    const session = { id, name, socket: server };
-    this.sessions.set(id, session);
+    const session = { id, clientKey, name, socket: server };
+    this.sessions.set(clientKey, session);
 
     server.addEventListener("message", (event) => {
       this.handleMessage(session, event.data);
     });
 
     const closeOrError = () => {
-      if (!this.sessions.has(id)) return;
-      this.sessions.delete(id);
+      if (this.sessions.get(clientKey) !== session) return;
+      this.sessions.delete(clientKey);
       this.broadcast({ type: "peer-left", id }, id);
     };
     server.addEventListener("close", closeOrError);
@@ -72,7 +84,7 @@ export class NetworkRoom {
     }
 
     if (data.type === "signal" && typeof data.to === "string") {
-      const target = this.sessions.get(data.to);
+      const target = Array.from(this.sessions.values()).find((s) => s.id === data.to);
       if (target) {
         try {
           target.socket.send(
@@ -84,7 +96,7 @@ export class NetworkRoom {
             })
           );
         } catch (err) {
-          this.sessions.delete(target.id);
+          this.sessions.delete(target.clientKey);
         }
       }
     }
@@ -97,7 +109,7 @@ export class NetworkRoom {
       try {
         session.socket.send(text);
       } catch (err) {
-        this.sessions.delete(session.id);
+        this.sessions.delete(session.clientKey);
       }
     }
   }
