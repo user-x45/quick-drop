@@ -19,24 +19,7 @@ export class NetworkRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-  }
-
-  getSockets() {
-    return this.state.getWebSockets();
-  }
-
-  findByClientKey(clientKey) {
-    return this.getSockets().find((ws) => {
-      const info = ws.deserializeAttachment();
-      return info && info.clientKey === clientKey;
-    });
-  }
-
-  findById(id) {
-    return this.getSockets().find((ws) => {
-      const info = ws.deserializeAttachment();
-      return info && info.id === id;
-    });
+    this.sessions = new Map();
   }
 
   async fetch(request) {
@@ -45,35 +28,34 @@ export class NetworkRoom {
       return new Response("WebSocket連携が必要です", { status: 426 });
     }
 
-    const url = new URL(request.url);
-    const clientKey = url.searchParams.get("clientKey") || crypto.randomUUID();
-
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-
-    const existing = this.findByClientKey(clientKey);
-    if (existing) {
-      const existingInfo = existing.deserializeAttachment();
-      this.broadcast({ type: "peer-left", id: existingInfo.id }, existingInfo.id);
-      try {
-        existing.close(1000, "replaced");
-      } catch (err) {}
-    }
+    server.accept();
 
     const id = crypto.randomUUID();
     const seed = Array.from(id).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
     const name = randomDeviceName(seed);
 
-    this.state.acceptWebSocket(server);
-    server.serializeAttachment({ id, clientKey, name });
+    const session = { id, name, socket: server };
+    this.sessions.set(id, session);
+
+    server.addEventListener("message", (event) => {
+      this.handleMessage(session, event.data);
+    });
+
+    const closeOrError = () => {
+      if (!this.sessions.has(id)) return;
+      this.sessions.delete(id);
+      this.broadcast({ type: "peer-left", id }, id);
+    };
+    server.addEventListener("close", closeOrError);
+    server.addEventListener("error", closeOrError);
 
     server.send(JSON.stringify({ type: "welcome", id, name }));
 
-    const peers = this.getSockets()
-      .filter((ws) => ws !== server)
-      .map((ws) => ws.deserializeAttachment())
-      .filter((info) => info && info.id !== id)
-      .map((info) => ({ id: info.id, name: info.name }));
+    const peers = Array.from(this.sessions.values())
+      .filter((s) => s.id !== id)
+      .map((s) => ({ id: s.id, name: s.name }));
     server.send(JSON.stringify({ type: "peer-list", peers }));
 
     this.broadcast({ type: "peer-joined", id, name }, id);
@@ -81,10 +63,7 @@ export class NetworkRoom {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws, raw) {
-    const info = ws.deserializeAttachment();
-    if (!info) return;
-
+  handleMessage(session, raw) {
     let data;
     try {
       data = JSON.parse(raw);
@@ -92,50 +71,34 @@ export class NetworkRoom {
       return;
     }
 
-    if (data.type === "ping") {
-      try {
-        ws.send(JSON.stringify({ type: "pong" }));
-      } catch (err) {}
-      return;
-    }
-
     if (data.type === "signal" && typeof data.to === "string") {
-      const target = this.findById(data.to);
+      const target = this.sessions.get(data.to);
       if (target) {
         try {
-          target.send(
+          target.socket.send(
             JSON.stringify({
               type: "signal",
-              from: info.id,
-              fromName: info.name,
+              from: session.id,
+              fromName: session.name,
               payload: data.payload,
             })
           );
-        } catch (err) {}
+        } catch (err) {
+          this.sessions.delete(target.id);
+        }
       }
     }
   }
 
-  async webSocketClose(ws) {
-    const info = ws.deserializeAttachment();
-    if (!info) return;
-    this.broadcast({ type: "peer-left", id: info.id }, info.id);
-  }
-
-  async webSocketError(ws) {
-    const info = ws.deserializeAttachment();
-    if (!info) return;
-    this.broadcast({ type: "peer-left", id: info.id }, info.id);
-  }
-
   broadcast(message, excludeId) {
     const text = JSON.stringify(message);
-    for (const ws of this.getSockets()) {
-      const info = ws.deserializeAttachment();
-      if (info && info.id === excludeId) continue;
+    for (const session of this.sessions.values()) {
+      if (session.id === excludeId) continue;
       try {
-        ws.send(text);
-      } catch (err) {}
+        session.socket.send(text);
+      } catch (err) {
+        this.sessions.delete(session.id);
+      }
     }
   }
 }
