@@ -15,11 +15,54 @@ function randomDeviceName(seed) {
   return `${a}${b}${n}`;
 }
 
+const PING_INTERVAL_MS = 5000;
+const SESSION_TIMEOUT_MS = 12000;
+
 export class NetworkRoom {
   constructor(state, env) {
     this.state = state;
     this.env = env;
     this.sessions = new Map();
+    this.sweepTimer = null;
+  }
+
+  startSweeper() {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => this.sweep(), PING_INTERVAL_MS);
+  }
+
+  stopSweeperIfIdle() {
+    if (this.sessions.size === 0 && this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+  }
+
+  sweep() {
+    const now = Date.now();
+    for (const session of Array.from(this.sessions.values())) {
+      if (now - session.lastSeen > SESSION_TIMEOUT_MS) {
+        this.dropSession(session.id, 1001, "timeout");
+        continue;
+      }
+      try {
+        session.socket.send(JSON.stringify({ type: "ping", t: now }));
+      } catch (err) {
+        this.dropSession(session.id, 1011, "send-failed");
+      }
+    }
+    this.stopSweeperIfIdle();
+  }
+
+  dropSession(id, code, reason) {
+    const session = this.sessions.get(id);
+    if (!session) return;
+    this.sessions.delete(id);
+    try {
+      session.socket.close(code, reason);
+    } catch (err) {}
+    this.broadcast({ type: "peer-left", id }, id);
+    this.stopSweeperIfIdle();
   }
 
   async fetch(request) {
@@ -36,17 +79,17 @@ export class NetworkRoom {
     const seed = Array.from(id).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
     const name = randomDeviceName(seed);
 
-    const session = { id, name, socket: server };
+    const session = { id, name, socket: server, lastSeen: Date.now() };
     this.sessions.set(id, session);
+    this.startSweeper();
 
     server.addEventListener("message", (event) => {
+      session.lastSeen = Date.now();
       this.handleMessage(session, event.data);
     });
 
     const closeOrError = () => {
-      if (!this.sessions.has(id)) return;
-      this.sessions.delete(id);
-      this.broadcast({ type: "peer-left", id }, id);
+      this.dropSession(id, 1000, "closed");
     };
     server.addEventListener("close", closeOrError);
     server.addEventListener("error", closeOrError);
@@ -71,6 +114,19 @@ export class NetworkRoom {
       return;
     }
 
+    if (data.type === "ping") {
+      try {
+        session.socket.send(JSON.stringify({ type: "pong" }));
+      } catch (err) {
+        this.dropSession(session.id, 1011, "send-failed");
+      }
+      return;
+    }
+
+    if (data.type === "pong") {
+      return;
+    }
+
     if (data.type === "signal" && typeof data.to === "string") {
       const target = this.sessions.get(data.to);
       if (target) {
@@ -84,7 +140,7 @@ export class NetworkRoom {
             })
           );
         } catch (err) {
-          this.sessions.delete(target.id);
+          this.dropSession(target.id, 1011, "send-failed");
         }
       }
     }
@@ -97,7 +153,7 @@ export class NetworkRoom {
       try {
         session.socket.send(text);
       } catch (err) {
-        this.sessions.delete(session.id);
+        this.dropSession(session.id, 1011, "send-failed");
       }
     }
   }
