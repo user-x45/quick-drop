@@ -127,6 +127,14 @@ export class NetworkRoom {
       return;
     }
 
+    if (data.type === "rename" && typeof data.name === "string") {
+      const name = data.name.trim().slice(0, 40);
+      if (!name) return;
+      session.name = name;
+      this.broadcast({ type: "peer-renamed", id: session.id, name }, session.id);
+      return;
+    }
+
     if (data.type === "signal" && typeof data.to === "string") {
       const target = this.sessions.get(data.to);
       if (target) {
