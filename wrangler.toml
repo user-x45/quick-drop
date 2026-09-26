@@ -9,3 +9,6 @@ class_name = "NetworkRoom"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["NetworkRoom"]
+
+[ai]
+binding = "AI"
