@@ -18,48 +18,6 @@ function randomDeviceName(seed) {
 const PING_INTERVAL_MS = 5000;
 const SESSION_TIMEOUT_MS = 12000;
 
-// 画像モデレーションに使うVisionモデル。カタログ変更に備えて一箇所にまとめておく。
-const MODERATION_MODEL = "@cf/meta/llama-3.2-11b-vision-instruct";
-const MAX_IMAGE_BYTES = 15 * 1024 * 1024; // 15MB程度で足切り（Workerのメモリ/実行時間対策）
-
-const MODERATION_PROMPT =
-  "あなたは画像モデレーターです。この画像に、次のいずれかに該当する内容が写っているか判定してください。\n" +
-  "1) 性的な内容（ヌード、性行為、際どい露出など）\n" +
-  "2) 暴力的・グロテスクな内容（流血、遺体、拷問、重度の怪我など）\n" +
-  "該当する場合は unsafe、該当しない場合は safe とだけ、他の文字を一切含めずに答えてください。";
-
-async function moderateImage(env, arrayBuffer, mime) {
-  const base64 = arrayBufferToBase64(arrayBuffer);
-  const dataUrl = `data:${mime || "image/jpeg"};base64,${base64}`;
-
-  const result = await env.AI.run(MODERATION_MODEL, {
-    messages: [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: MODERATION_PROMPT },
-          { type: "image_url", image_url: { url: dataUrl } },
-        ],
-      },
-    ],
-  });
-
-  const text = (result && (result.response || result.result || "")).toString().toLowerCase();
-  // モデルが多少余計な文字を返しても "unsafe" を含んでいればNG扱いにする（安全側に倒す）
-  const isUnsafe = text.includes("unsafe");
-  return !isUnsafe;
-}
-
-function arrayBufferToBase64(buffer) {
-  let binary = "";
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-  }
-  return btoa(binary);
-}
-
 export class NetworkRoom {
   constructor(state, env) {
     this.state = state;
@@ -108,12 +66,6 @@ export class NetworkRoom {
   }
 
   async fetch(request) {
-    const url = new URL(request.url);
-
-    if (url.pathname.endsWith("/upload-image") && request.method === "POST") {
-      return this.handleImageUpload(request);
-    }
-
     const upgradeHeader = request.headers.get("Upgrade");
     if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
       return new Response("WebSocket連携が必要です", { status: 426 });
@@ -202,79 +154,6 @@ export class NetworkRoom {
     }
   }
 
-  async handleImageUpload(request) {
-    const toId = request.headers.get("X-Target-Id") || "";
-    const fromId = request.headers.get("X-Sender-Id") || "";
-    let name = request.headers.get("X-File-Name") || "image";
-    try {
-      name = decodeURIComponent(name);
-    } catch (err) {}
-    const mime = request.headers.get("X-File-Mime") || "application/octet-stream";
-
-    const target = this.sessions.get(toId);
-    const sender = this.sessions.get(fromId);
-
-    if (!target || !sender) {
-      return new Response(JSON.stringify({ ok: false, reason: "peer-not-found" }), {
-        status: 404,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    const arrayBuffer = await request.arrayBuffer();
-
-    if (arrayBuffer.byteLength === 0 || arrayBuffer.byteLength > MAX_IMAGE_BYTES) {
-      return new Response(JSON.stringify({ ok: false, reason: "size" }), {
-        status: 413,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    let safe;
-    try {
-      safe = await moderateImage(this.env, arrayBuffer, mime);
-    } catch (err) {
-      // 判定自体に失敗した場合は安全側に倒して送信をブロックする
-      return new Response(JSON.stringify({ ok: false, reason: "moderation-error" }), {
-        status: 502,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    if (!safe) {
-      return new Response(JSON.stringify({ ok: false, reason: "unsafe" }), {
-        status: 422,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    const base64 = arrayBufferToBase64(arrayBuffer);
-    try {
-      target.socket.send(
-        JSON.stringify({
-          type: "incoming-image",
-          from: fromId,
-          fromName: sender.name,
-          name,
-          mime,
-          size: arrayBuffer.byteLength,
-          data: base64,
-        })
-      );
-    } catch (err) {
-      this.dropSession(target.id, 1011, "send-failed");
-      return new Response(JSON.stringify({ ok: false, reason: "delivery-failed" }), {
-        status: 502,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    return new Response(JSON.stringify({ ok: true }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  }
-
   broadcast(message, excludeId) {
     const text = JSON.stringify(message);
     for (const session of this.sessions.values()) {
@@ -326,7 +205,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/ws" || url.pathname === "/upload-image") {
+    if (url.pathname === "/ws") {
       const networkId = networkIdFromRequest(request);
       const objId = env.NETWORK_ROOM.idFromName(networkId);
       const stub = env.NETWORK_ROOM.get(objId);
